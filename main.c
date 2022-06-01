@@ -1,0 +1,604 @@
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+
+#include "opt.h"
+#include "spi.h"
+#include "i2c.h"
+#include "VirtualSerial.h"
+
+#define C12880MA_CLK PORTF1
+#define C12880MA_TRG PORTF4
+#define C12880MA_EOS PORTF0
+#define C12880MA_ST PORTF5
+#define C12880MA_PORT PORTF
+
+#define digital_out_high(port, pin){ port |= (1<<pin);}
+#define digital_out_low(port, pin){ port &= ~(1<<pin);}
+
+static bool cdc_recived = 0;
+static char cdc_recive_buffer[32];
+static int cdc_recive_index = 0;
+
+static int opticalPowerRaw[C12880MA_CHANELS] = {0};
+static float opticalPower[SENSOR_CHANNELS] = {0};
+static int darkopticalPower[EXPOSURE_TIME_SEL_N][SENSOR_CHANNELS];
+
+#define STATUS_RUN               0
+#define STATUS_WARN              1
+#define STATUS_ERROR             2
+#define AUTO_EXPOSURE_AUTO          1
+#define AUTO_EXPOSURE_MANUAL        0
+
+static int status = STATUS_RUN;
+static int auto_exposure = AUTO_EXPOSURE_MANUAL;
+static int exposure_time_sel = EXPOSURE_TIME_SEL_100us;
+static long exposure_time = EXPOSURE_TIME_100us;
+static float temperature = 25.0;
+static float temperature_dark = 0.0;
+
+static FILE USBSerialStream;
+
+USB_ClassInfo_CDC_Device_t VirtualSerial_CDC_Interface =
+	{
+		.Config =
+			{
+				.ControlInterfaceNumber   = INTERFACE_ID_CDC_CCI,
+				.DataINEndpoint           =
+					{
+						.Address          = CDC_TX_EPADDR,
+						.Size             = CDC_TXRX_EPSIZE,
+						.Banks            = 1,
+					},
+				.DataOUTEndpoint =
+					{
+						.Address          = CDC_RX_EPADDR,
+						.Size             = CDC_TXRX_EPSIZE,
+						.Banks            = 1,
+					},
+				.NotificationEndpoint =
+					{
+						.Address          = CDC_NOTIFICATION_EPADDR,
+						.Size             = CDC_NOTIFICATION_EPSIZE,
+						.Banks            = 1,
+					},
+			},
+        .State =
+            {
+                .LineEncoding = 
+                    {
+                        .BaudRateBPS = 9600,
+                        .CharFormat = CDC_LINEENCODING_OneStopBit,
+                        .DataBits = 8,
+                        .ParityType = CDC_PARITY_None,
+                    }
+            }
+	};
+
+void EVENT_USB_Device_Connect(void)
+{
+	
+}
+
+void EVENT_USB_Device_Disconnect(void)
+{
+	
+}
+
+void EVENT_USB_Device_ConfigurationChanged(void)
+{
+	bool ConfigSuccess = true;
+
+	ConfigSuccess &= CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface);
+
+	
+}
+
+void EVENT_USB_Device_ControlRequest(void)
+{
+	CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
+}
+
+void EVENT_CDC_Device_ControLineStateChanged(USB_ClassInfo_CDC_Device_t *const CDCInterfaceInfo)
+{
+
+}
+void delay()
+{
+    asm volatile("nop");
+    asm volatile("nop");
+    asm volatile("nop");
+    asm volatile("nop");
+    asm volatile("nop");
+}
+void adc_temp_init()
+{
+
+}
+
+float adc_temp_read()
+{
+    int channel = 7;
+    ADMUX = 0b01000000;
+    ADMUX |= (channel & 0x1F);
+    ADCSRB = 0b00000000;
+    ADCSRB |= (((channel >> 5) & 1) << MUX5);
+    ADCSRA = (1 << ADEN) | (1 << ADSC) | 7;
+
+    while ((ADCSRA & (1<<ADSC)));
+
+    float v =  (ADCL | (ADCH << 8)) & 0x3FF; 
+
+    const float resis = 10.0e3;
+    const float resi0 = 10.0e3;
+    const float tr25 = 25;
+    const float K = 273.15;
+    const float B = 3435;
+    float vcc = 5.0;
+    float vcoff = 5.0 / 1.023;
+    v = v / 1023 * 5.0;
+
+    float resi1 = (vcc - v) == 0 ? 0 : (v * resis) / (vcc - v);
+    float t = 1 / (logf(resi1/resi0) / B + (1 / (tr25 + K))) - K;
+
+    return t;
+}
+
+void mcp3201_init()
+{
+    spi_init();
+    DDRB |= (1<<PORTB0);
+    PORTB |= (1<<PORTB0);
+}
+unsigned int mcp3201_read()
+{
+    PORTB &= ~(1<<PORTB0);
+    asm volatile("nop");
+    char high_byte = spi_transfer(0) & 0x1F;
+    char low_byte = spi_transfer(0);
+    PORTB |= (1<<PORTB0);
+
+    return (((high_byte << 7) & 0xF80) | ((low_byte >> 1) & 0x7F)) & 0xFFF;
+}
+
+static float conv_wl(int index)
+{
+    float a1 = pgm_read_float(&wccoeff[0]);
+    float a2 = pgm_read_float(&wccoeff[1]);
+    float a3 = pgm_read_float(&wccoeff[2]);
+    float a4 = pgm_read_float(&wccoeff[3]);
+    float a5 = pgm_read_float(&wccoeff[4]);
+    float a6 = pgm_read_float(&wccoeff[5]);
+    int i = index;
+
+    return a1 + a2 * i + a3 * i * i + a4 * i * i * i + a5 * i * i * i * i + a6 * i * i * i * i * i;
+}
+
+static float lerp(float x0, float y0, float x1, float y1, float x) {
+  return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+}
+
+void c12880ma_init()
+{
+    DDRF |= (1<<C12880MA_CLK);
+    PORTF &= ~(1<<C12880MA_CLK);
+    DDRF |= (1<<C12880MA_ST);
+    PORTF &= ~(1<<C12880MA_ST);
+
+    for(int i=0;i<C12880MA_CHANELS;i++)
+    {
+        opticalPowerRaw[i] = 0;
+    }
+    for(int i=0;i<SENSOR_CHANNELS;i++)
+    {
+        opticalPower[i] = 0;
+        for(int j=0;j<EXPOSURE_TIME_SEL_N;j++)
+        {
+            darkopticalPower[j][i] = 0;
+        }
+    }
+}
+
+void c12880ma_read()
+{
+    for(int i=0;i<C12880MA_CHANELS;i++)
+    {
+        opticalPowerRaw[i] = 0;
+    }
+
+    digital_out_low(C12880MA_PORT, C12880MA_CLK);
+    delay();
+    digital_out_high(C12880MA_PORT, C12880MA_CLK);
+    delay();
+    digital_out_low(C12880MA_PORT, C12880MA_CLK);
+    digital_out_high(C12880MA_PORT, C12880MA_ST);
+    delay();
+
+    for(int i=0;i<3;i++)
+    {
+         digital_out_high(C12880MA_PORT, C12880MA_CLK);
+        delay();
+        digital_out_low(C12880MA_PORT, C12880MA_CLK);
+        delay();
+    }
+
+    for(long i=0;i<exposure_time;i++)
+    {
+         digital_out_high(C12880MA_PORT, C12880MA_CLK);
+        delay();
+        digital_out_low(C12880MA_PORT, C12880MA_CLK);
+        delay();
+    }
+
+    digital_out_low(C12880MA_PORT, C12880MA_ST);
+
+    for(int i=0;i<88;i++)
+    {
+        digital_out_high(C12880MA_PORT, C12880MA_CLK);
+        delay();
+        digital_out_low(C12880MA_PORT, C12880MA_CLK);
+        delay();
+    }
+    
+    for(int i=0;i<C12880MA_CHANELS;i++)
+    {
+        //if(bit_is_set(PIND,C12880MA_TRG))  
+        opticalPowerRaw[i] = (float)mcp3201_read();
+        digital_out_high(C12880MA_PORT, C12880MA_CLK);
+        delay();
+        digital_out_low(C12880MA_PORT, C12880MA_CLK);
+        delay();
+    }
+
+    int len = sizeof(wl_lut_10nm) / sizeof(int);
+    for(int i = 0; i < len; i++)
+    {
+        int wl = pgm_read_word(&wl_10nm[i]); 
+        int j = pgm_read_word(&wl_lut_10nm[i]);
+        float wl1 = conv_wl(j - 1);
+        float wl2 = conv_wl(j);
+        float op1 = (opticalPowerRaw[j - 2] + opticalPowerRaw[j - 1] + opticalPowerRaw[j]) / 3.f;//opticalPowerRaw[j - 1];
+        float op2 = (opticalPowerRaw[j - 1] + opticalPowerRaw[j] + opticalPowerRaw[j + 1]) / 3.f;//opticalPowerRaw[j];
+
+        float op = lerp(wl1, op1, wl2, op2, wl);
+        if(op < 0.0f)
+        {
+            op = 0.0f;
+        }
+        opticalPower[i] = op;
+    }
+}
+
+int check_status()
+{
+    if(temperature > 40.0f)
+    {
+        return STATUS_ERROR;
+    }
+    if(fabs(temperature_dark - temperature) >= 2.0f)
+    {
+        return STATUS_WARN;
+    }
+
+    return STATUS_RUN;
+}
+
+void SetupHardware(void)
+{
+    // MCUCR = 0x80;
+    // MCUCR = 0x80;
+    
+    c12880ma_init();
+    mcp3201_init();
+    adc_temp_init();
+    
+    MCUSR &= ~(1 << WDRF);
+	wdt_disable();
+	clock_prescale_set(clock_div_1);
+
+    USB_Init();
+}
+
+void correct()
+{
+    for(int i=0;i<SENSOR_CHANNELS;i++)
+    {
+        float value = opticalPower[i] - darkopticalPower[exposure_time_sel][i];
+        if(value < 0.0f){
+            value = 0.0f;
+        }
+        opticalPower[i] = (value / (pgm_read_float(&spectralsensitivitycoeff[i])) / pgm_read_float(&unitcoeff[exposure_time_sel]));
+        if(opticalPower[i] < 1e-9f){
+            opticalPower[i] = 0.0f;
+        }
+    }
+}
+
+long select_exposure_time(int sel)
+{
+    switch (sel)
+    {
+    case EXPOSURE_TIME_SEL_100us:
+        return EXPOSURE_TIME_100us;
+    case EXPOSURE_TIME_SEL_200us:
+        return EXPOSURE_TIME_200us;
+    case EXPOSURE_TIME_SEL_500us:
+        return EXPOSURE_TIME_500us;
+    case EXPOSURE_TIME_SEL_1ms:
+        return EXPOSURE_TIME_1ms;
+    case EXPOSURE_TIME_SEL_2ms:
+        return EXPOSURE_TIME_2ms;
+    case EXPOSURE_TIME_SEL_5ms:
+        return EXPOSURE_TIME_5ms;
+    case EXPOSURE_TIME_SEL_10ms:
+        return EXPOSURE_TIME_10ms;
+    case EXPOSURE_TIME_SEL_20ms:
+        return EXPOSURE_TIME_20ms;
+    case EXPOSURE_TIME_SEL_50ms:
+        return EXPOSURE_TIME_50ms;
+    case EXPOSURE_TIME_SEL_100ms:
+        return EXPOSURE_TIME_100ms;
+    default:
+        return EXPOSURE_TIME_100us;
+    }
+}
+void measure()
+{
+    if(auto_exposure)
+    {
+        for(int i=0;i<EXPOSURE_TIME_SEL_N;i++)
+        {
+            exposure_time = select_exposure_time(i);
+
+            c12880ma_read();
+
+            float max = 0;
+            for(int i=0;i<C12880MA_CHANELS;i++)
+            {
+                max = MAX(max, opticalPower[i]);
+            }
+            if(max >= 1000)
+                break;
+        }
+    }
+    else
+    {
+        exposure_time = select_exposure_time(exposure_time_sel);
+        c12880ma_read();
+    }
+}
+
+void dark()
+{    
+    for(int i=0;i<EXPOSURE_TIME_SEL_N;i++)
+    {
+        
+        exposure_time = select_exposure_time(i);
+        c12880ma_read();
+        
+        int len = sizeof(wl_lut_10nm) / sizeof(int);
+        for(int k = 0; k < len; k++)
+        {
+            int wl = pgm_read_word(&wl_10nm[i]); 
+            int j = pgm_read_word(&wl_lut_10nm[i]);
+            float wl1 = conv_wl(j - 1);
+            float wl2 = conv_wl(j);
+            float op1 = opticalPowerRaw[j - 1];
+            float op2 = opticalPowerRaw[j];
+
+            float op = lerp(wl1, op1, wl2, op2, wl);
+            if(op < 0.0f)
+            {
+                op = 0.0f;
+            }
+            darkopticalPower[i][k] = (int)op;
+        }
+    }
+
+    temperature_dark = adc_temp_read();
+}
+
+void CDC_Recive_Event()
+{
+    int d = CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
+    if(d > 0)
+    {
+        cdc_recive_buffer[cdc_recive_index] = d;
+        cdc_recive_index++;
+        if(d == '\n')
+        {
+            cdc_recived = true;
+        }
+    }
+}
+
+void CDC_Recive_Event_Process()
+{
+    if(cdc_recived)
+    {
+        cdc_recived = false;
+        char* message = cdc_recive_buffer;
+        
+        if(strncmp(message,"MEAS\n", 5) == 0)
+        {
+            measure();
+            correct();
+            
+            for(int i=0;i<SENSOR_CHANNELS;i++)
+            {
+                int wl = pgm_read_word(&wl_10nm[i]);
+                char msg[32] = {0};
+                sprintf(msg, "%d:%g\r", wl, opticalPower[i]);
+                CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+            }
+            CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
+        }
+        else if(strncmp(message,"RAW", 3) == 0)
+        {
+            measure();
+
+            for(int i=0;i<C12880MA_CHANELS;i++)
+            {
+                char msg[16] = {0};
+                sprintf(msg, "%d\r", opticalPowerRaw[i]);
+                CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+            }
+            CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
+        }
+        else if(strncmp(message,"DARK", 4) == 0)
+        {
+            dark();
+            // for(int j=0;j<EXPOSURE_TIME_SEL_N;j++)
+            // {
+            //     char msg2[32] = {0};
+            //     sprintf(msg2, "EXP:%d\r", j);
+            //     CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg2);    
+            //     for(int i=0;i<SENSOR_CHANNELS;i++)
+            //     {
+            //         int wl = pgm_read_word(&wl_10nm[i]);
+            //         char msg[32] = {0};
+            //         sprintf(msg, "%d:%d\r", wl, darkopticalPower[j][i]);
+            //         CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+            //     }
+            //     CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
+            // }
+            CDC_Device_SendString(&VirtualSerial_CDC_Interface, "ACK\n");    
+        }
+        // else if(strncmp(message,"SICF", 4) == 0)
+        // {
+        //     for(int i=0;i<C12880MA_CHANELS;i++)
+        //     {
+        //         char msg[16] = {0};
+        //         sprintf(msg, "%g\r", pgm_read_float(&spectralsensitivitycoeff[i]));
+        //         CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+        //     }
+        //     CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
+        // }
+        else if(strncmp(message,"WCCF", 3) == 0)
+        {
+            
+            char msg[100] = {0};
+            sprintf(msg, "WCCF/%g:%g:%g:%g:%g:%g\n", pgm_read_float(&wccoeff[0]), pgm_read_float(&wccoeff[1]), pgm_read_float(&wccoeff[2]), pgm_read_float(&wccoeff[3]), pgm_read_float(&wccoeff[4]), pgm_read_float(&wccoeff[5]));
+            CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+        }
+        else if(strncmp(message,"ST?", 3) == 0)
+        {
+            
+            int msg[32] = {0};
+            char st = status == STATUS_RUN ? 'R' : status == STATUS_WARN ? 'W' : 'E';
+            sprintf(msg, "ST/%c:%.3f\n", st, temperature);
+            CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+        }
+        else if(strncmp(message,"EXP/", 4) == 0)
+        {
+            if(strncmp(message, "EXP/AUTO", 8) == 0)
+            {
+                auto_exposure = 1;
+            }
+            else if(strncmp(message, "EXP/100us", 9) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_100us;
+            }
+            else if(strncmp(message, "EXP/200us", 9) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_200us;
+            }
+            else if(strncmp(message, "EXP/500us", 9) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_500us;
+            }
+            else if(strncmp(message, "EXP/1ms", 7) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_1ms;
+            }
+            else if(strncmp(message, "EXP/2ms", 7) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_2ms;
+            }
+            else if(strncmp(message, "EXP/5ms", 7) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_5ms;
+            }
+            else if(strncmp(message, "EXP/10ms", 8) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_10ms;
+            }
+            else if(strncmp(message, "EXP/20ms", 8) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_20ms;
+            }
+            else if(strncmp(message, "EXP/50ms", 8) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_50ms;
+            }
+            else if(strncmp(message, "EXP/100ms", 9) == 0)
+            {
+                auto_exposure = 0;
+                exposure_time_sel = EXPOSURE_TIME_SEL_100ms;
+            }
+            CDC_Device_SendString(&VirtualSerial_CDC_Interface, "ACK\n");    
+        }
+        else
+        {
+            CDC_Device_SendString(&VirtualSerial_CDC_Interface, "NAK\n");
+        }
+        memset(cdc_recive_buffer, 0, 32);
+        cdc_recive_index = 0;
+    }
+}
+
+// void test()
+// {
+//     measure();
+            
+//     char msg[16] = {0};
+//     sprintf(msg, "EXP:%d\r", exposure_time_sel);
+//     CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);
+//     for(int i=0;i<C12880MA_CHANELS;i++)
+//     {
+//         char msg[16] = {0};
+//         sprintf(msg, "%g\r", opticalPower[i]);
+//         CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+//     }
+//     CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
+// }
+
+int main(void)
+{
+	SetupHardware();
+
+	CDC_Device_CreateStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
+
+	GlobalInterruptEnable();
+
+    c12880ma_read();
+
+    temperature = adc_temp_read();
+
+	for (;;)
+	{
+        temperature = adc_temp_read();
+        status = check_status();
+        
+        CDC_Recive_Event_Process();
+        CDC_Recive_Event();
+        
+		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
+		USB_USBTask();
+
+	}
+}
+
+
+
