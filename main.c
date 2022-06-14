@@ -1,4 +1,5 @@
 #include <avr/io.h>
+#include <avr/pgmspace.h>
 #include <util/delay.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -22,9 +23,9 @@ static bool cdc_recived = 0;
 static char cdc_recive_buffer[32];
 static int cdc_recive_index = 0;
 
-static int opticalPowerRaw[C12880MA_CHANELS] = {0};
-static float opticalPower[SENSOR_CHANNELS] = {0};
-static int darkopticalPower[EXPOSURE_TIME_SEL_N][SENSOR_CHANNELS];
+static float opticalPower[C12880MA_CHANELS] = {0};
+static int darkopticalPower[C12880MA_CHANELS] = {0};
+static float darkopticalPowerGain[EXPOSURE_TIME_SEL_N] = {1.0f};
 
 #define STATUS_RUN               0
 #define STATUS_WARN              1
@@ -171,7 +172,7 @@ static float conv_wl(int index)
     float a4 = pgm_read_float(&wccoeff[3]);
     float a5 = pgm_read_float(&wccoeff[4]);
     float a6 = pgm_read_float(&wccoeff[5]);
-    int i = index;
+    int i = index + 1;
 
     return a1 + a2 * i + a3 * i * i + a4 * i * i * i + a5 * i * i * i * i + a6 * i * i * i * i * i;
 }
@@ -189,23 +190,16 @@ void c12880ma_init()
 
     for(int i=0;i<C12880MA_CHANELS;i++)
     {
-        opticalPowerRaw[i] = 0;
-    }
-    for(int i=0;i<SENSOR_CHANNELS;i++)
-    {
         opticalPower[i] = 0;
-        for(int j=0;j<EXPOSURE_TIME_SEL_N;j++)
-        {
-            darkopticalPower[j][i] = 0;
-        }
     }
+    
 }
 
 void c12880ma_read()
 {
     for(int i=0;i<C12880MA_CHANELS;i++)
     {
-        opticalPowerRaw[i] = 0;
+        opticalPower[i] = 0;
     }
 
     digital_out_low(C12880MA_PORT, C12880MA_CLK);
@@ -244,31 +238,17 @@ void c12880ma_read()
     
     for(int i=0;i<C12880MA_CHANELS;i++)
     {
-        //if(bit_is_set(PIND,C12880MA_TRG))  
-        opticalPowerRaw[i] = (float)mcp3201_read();
+        opticalPower[i] = (float)mcp3201_read();
         digital_out_high(C12880MA_PORT, C12880MA_CLK);
         delay();
         digital_out_low(C12880MA_PORT, C12880MA_CLK);
         delay();
     }
 
-    int len = sizeof(wl_lut_10nm) / sizeof(int);
-    for(int i = 0; i < len; i++)
-    {
-        int wl = pgm_read_word(&wl_10nm[i]); 
-        int j = pgm_read_word(&wl_lut_10nm[i]);
-        float wl1 = conv_wl(j - 1);
-        float wl2 = conv_wl(j);
-        float op1 = (opticalPowerRaw[j - 2] + opticalPowerRaw[j - 1] + opticalPowerRaw[j]) / 3.f;//opticalPowerRaw[j - 1];
-        float op2 = (opticalPowerRaw[j - 1] + opticalPowerRaw[j] + opticalPowerRaw[j + 1]) / 3.f;//opticalPowerRaw[j];
-
-        float op = lerp(wl1, op1, wl2, op2, wl);
-        if(op < 0.0f)
-        {
-            op = 0.0f;
-        }
-        opticalPower[i] = op;
-    }
+    // for(int i=2;i<C12880MA_CHANELS-2;i++)
+    // {
+    //     opticalPower[i] = (-3.0f * opticalPower[i-2] + 12.0f * opticalPower[i-1] + 17.0f * opticalPower[i] + 12.0f * opticalPower[i+1] - 3.0f * opticalPower[i+1]) / 35.0f;
+    // }
 }
 
 int check_status()
@@ -303,13 +283,13 @@ void SetupHardware(void)
 
 void correct()
 {
-    for(int i=0;i<SENSOR_CHANNELS;i++)
+    for(int i=0;i<C12880MA_CHANELS;i++)
     {
-        float value = opticalPower[i] - darkopticalPower[exposure_time_sel][i];
+        float value = opticalPower[i] - darkopticalPower[i] * darkopticalPowerGain[exposure_time_sel];
         if(value < 0.0f){
             value = 0.0f;
         }
-        opticalPower[i] = (value / (pgm_read_float(&spectralsensitivitycoeff[i])) / pgm_read_float(&unitcoeff[exposure_time_sel]));
+        opticalPower[i] = value / pgm_read_float(&unitcoeff[exposure_time_sel]) / pgm_read_float(&spectralsensitivitycoeff[i]);
         if(opticalPower[i] < 1e-9f){
             opticalPower[i] = 0.0f;
         }
@@ -351,15 +331,16 @@ void measure()
         for(int i=0;i<EXPOSURE_TIME_SEL_N;i++)
         {
             exposure_time = select_exposure_time(i);
-
+            exposure_time_sel = i;
             c12880ma_read();
 
             float max = 0;
+            float th = 1000.0f;
             for(int i=0;i<C12880MA_CHANELS;i++)
             {
                 max = MAX(max, opticalPower[i]);
             }
-            if(max >= 1000)
+            if(max >= th)
                 break;
         }
     }
@@ -378,25 +359,29 @@ void dark()
         exposure_time = select_exposure_time(i);
         c12880ma_read();
         
-        int len = sizeof(wl_lut_10nm) / sizeof(int);
-        for(int k = 0; k < len; k++)
+        for(int j=2;j<C12880MA_CHANELS-2;j++)
         {
-            int wl = pgm_read_word(&wl_10nm[i]); 
-            int j = pgm_read_word(&wl_lut_10nm[i]);
-            float wl1 = conv_wl(j - 1);
-            float wl2 = conv_wl(j);
-            float op1 = opticalPowerRaw[j - 1];
-            float op2 = opticalPowerRaw[j];
+            opticalPower[j] = (-3.0f * opticalPower[j-2] + 12.0f * opticalPower[j-1] + 17.0f * opticalPower[j] + 12.0f * opticalPower[j+1] - 3.0f * opticalPower[j+1]) / 35.0f;
+        }
 
-            float op = lerp(wl1, op1, wl2, op2, wl);
-            if(op < 0.0f)
+        darkopticalPowerGain[i] = 4095.0f;
+        for(int j=0;j<C12880MA_CHANELS;j++)
+        {
+            if(i == EXPOSURE_TIME_SEL_1ms)
             {
-                op = 0.0f;
+                darkopticalPower[j] = opticalPower[j];
             }
-            darkopticalPower[i][k] = (int)op;
+            if(darkopticalPowerGain[i] > opticalPower[j])
+            {
+                darkopticalPowerGain[i] = opticalPower[j];
+            }
         }
     }
-
+    float x = darkopticalPowerGain[EXPOSURE_TIME_SEL_1ms];
+    for(int i=0;i<EXPOSURE_TIME_SEL_N;i++)
+    {
+        darkopticalPowerGain[i] /= x;
+    }
     temperature_dark = adc_temp_read();
 }
 
@@ -426,12 +411,50 @@ void CDC_Recive_Event_Process()
             measure();
             correct();
             
-            for(int i=0;i<SENSOR_CHANNELS;i++)
+            for(int i=0;i<C12880MA_CHANELS;i++)
             {
-                int wl = pgm_read_word(&wl_10nm[i]);
+#ifdef CP150
+                if(i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[470]) + 1 )
+#endif
+#ifdef CP160
+                if(i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[490]) + 1 )
+#endif
+                {
+                    float wl = conv_wl(i);
+                    char msg[32] = {0};
+                    sprintf(msg, "%f:%g\r", wl, opticalPower[i]);
+                    CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+                }
+            }
+            CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
+        }
+        else if(strncmp(message,"MEAS1nm\n", 9) == 0)
+        {
+            measure();
+            correct();
+#ifdef CP150
+            for(int i=0;i<471;i++)
+#endif
+#ifdef CP160
+            for(int i=0;i<491;i++)
+#endif
+            {
+                int wl = pgm_read_word(&wl_1nm[i]);
+                int j = pgm_read_word(&wl_lut_1nm[i]);
+                float wl1 = conv_wl(j - 1);
+                float wl2 = conv_wl(j);
+                float op1 = opticalPower[j - 1];
+                float op2 = opticalPower[j];
+
+                float op = lerp(wl1, op1, wl2, op2, wl);
+                if(op < 0.0f)
+                {
+                    op = 0.0f;
+                }
                 char msg[32] = {0};
-                sprintf(msg, "%d:%g\r", wl, opticalPower[i]);
+                sprintf(msg, "%d:%g\r", wl, op);
                 CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
+                wl += 1;
             }
             CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
         }
@@ -442,7 +465,7 @@ void CDC_Recive_Event_Process()
             for(int i=0;i<C12880MA_CHANELS;i++)
             {
                 char msg[16] = {0};
-                sprintf(msg, "%d\r", opticalPowerRaw[i]);
+                sprintf(msg, "%d\r", (int)opticalPower[i]);
                 CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
             }
             CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
@@ -450,20 +473,6 @@ void CDC_Recive_Event_Process()
         else if(strncmp(message,"DARK", 4) == 0)
         {
             dark();
-            // for(int j=0;j<EXPOSURE_TIME_SEL_N;j++)
-            // {
-            //     char msg2[32] = {0};
-            //     sprintf(msg2, "EXP:%d\r", j);
-            //     CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg2);    
-            //     for(int i=0;i<SENSOR_CHANNELS;i++)
-            //     {
-            //         int wl = pgm_read_word(&wl_10nm[i]);
-            //         char msg[32] = {0};
-            //         sprintf(msg, "%d:%d\r", wl, darkopticalPower[j][i]);
-            //         CDC_Device_SendString(&VirtualSerial_CDC_Interface, msg);    
-            //     }
-            //     CDC_Device_SendByte(&VirtualSerial_CDC_Interface, '\n');
-            // }
             CDC_Device_SendString(&VirtualSerial_CDC_Interface, "ACK\n");    
         }
         // else if(strncmp(message,"SICF", 4) == 0)
