@@ -361,7 +361,7 @@ void dark()
         
         for(int j=2;j<C12880MA_CHANELS-2;j++)
         {
-            opticalPower[j] = (-3.0f * opticalPower[j-2] + 12.0f * opticalPower[j-1] + 17.0f * opticalPower[j] + 12.0f * opticalPower[j+1] - 3.0f * opticalPower[j+1]) / 35.0f;
+            opticalPower[j] = (-3.0f * opticalPower[j-2] + 12.0f * opticalPower[j-1] + 17.0f * opticalPower[j] + 12.0f * opticalPower[j+1] - 3.0f * opticalPower[j+2]) / 35.0f;
         }
 
         darkopticalPowerGain[i] = 4095.0f;
