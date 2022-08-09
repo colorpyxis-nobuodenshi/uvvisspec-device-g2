@@ -418,18 +418,20 @@ void dark()
             }
         }
 
-        darkopticalPowerGain[i] = 4095.0f;
+        darkopticalPowerGain[i] = 0.0f;
         for (int j = 0; j < C12880MA_CHANELS; j++)
         {
             if (i == EXPOSURE_TIME_SEL_5ms)
             {
                 darkopticalPower[j] = opticalPower[j];
             }
-            if (darkopticalPowerGain[i] > opticalPower[j])
-            {
-                darkopticalPowerGain[i] = opticalPower[j];
-            }
+            // if (darkopticalPowerGain[i] > opticalPower[j])
+            // {
+            //     darkopticalPowerGain[i] = opticalPower[j];
+            // }
+            darkopticalPowerGain[i] += opticalPower[j];
         }
+        darkopticalPowerGain[i] /= (float)C12880MA_CHANELS;
     }
     float x = darkopticalPowerGain[EXPOSURE_TIME_SEL_5ms];
     for (int i = 0; i < EXPOSURE_TIME_SEL_N; i++)
