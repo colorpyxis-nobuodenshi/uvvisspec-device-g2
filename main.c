@@ -176,6 +176,24 @@ static float conv_wl(int index)
     return a1 + a2 * i + a3 * i * i + a4 * i * i * i + a5 * i * i * i * i + a6 * i * i * i * i * i;
 }
 
+static float linear(int index)
+{
+    int i = index;
+    int x = pgm_read_word(&wl_1nm[i]);
+    int j = pgm_read_word(&wl_lut_1nm[i]);
+    float x1 = conv_wl(j - 1);
+    float x2 = conv_wl(j);
+    float y1 = opticalPower[j - 1];
+    float y2 = opticalPower[j];
+
+    float y = lerp(x1, y1, x2, y2, x);
+    if (y < 0.0f)
+    {
+        y = 0.0f;
+    }
+    return y;
+}
+
 static float lagrange(int index)
 {
     float x = pgm_read_word(&wl_1nm[index]);
@@ -491,18 +509,7 @@ void CDC_Recive_Event_Process()
                 for (int i = 0; i < 491; i++)
 #endif
                 {
-                    // int wl = pgm_read_word(&wl_1nm[i]);
-                    // int j = pgm_read_word(&wl_lut_1nm[i]);
-                    // float wl1 = conv_wl(j - 1);
-                    // float wl2 = conv_wl(j);
-                    // float op1 = opticalPower[j - 1];
-                    // float op2 = opticalPower[j];
-
-                    // float op = lerp(wl1, op1, wl2, op2, wl);
-                    // if (op < 0.0f)
-                    // {
-                    //     op = 0.0f;
-                    // }
+                    
                     float op = lagrange(i);
                     float wl = wl_1nm[i];
                     char msg[32] = {0};
