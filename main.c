@@ -425,10 +425,6 @@ void dark()
             {
                 darkopticalPower[j] = opticalPower[j];
             }
-            // if (darkopticalPowerGain[i] > opticalPower[j])
-            // {
-            //     darkopticalPowerGain[i] = opticalPower[j];
-            // }
             darkopticalPowerGain[i] += opticalPower[j];
         }
         darkopticalPowerGain[i] /= (float)C12880MA_CHANELS;
