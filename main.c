@@ -520,6 +520,9 @@ void CDC_Recive_Event_Process()
 #ifdef CP160
                     if (i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[490]))
 #endif
+#ifdef CP180
+                    if (i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[490]))
+#endif
                     {
                         float wl = conv_wl(i);
                         char msg[32] = {0};
@@ -537,6 +540,9 @@ void CDC_Recive_Event_Process()
             for (int i = 0; i < 471; i++)
 #endif
 #ifdef CP160
+                for (int i = 0; i < 491; i++)
+#endif
+#ifdef CP180
                 for (int i = 0; i < 491; i++)
 #endif
                 {
