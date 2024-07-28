@@ -521,7 +521,7 @@ void CDC_Recive_Event_Process()
                     if (i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[490]))
 #endif
 #ifdef CP180
-                    if (i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[262]))
+                    if (i >= pgm_read_word(&wl_lut_1nm[0]) - 1 && i <= pgm_read_word(&wl_lut_1nm[240]))
 #endif
                     {
                         float wl = conv_wl(i);

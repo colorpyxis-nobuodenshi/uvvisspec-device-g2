@@ -22,10 +22,10 @@ all:
 	# $(OBJCOPY) -j .text -j .data -O ihex $(TARGET).bin $(TARGET).hex
 
 fuses:
-	avrdude -p $(MCU2) -c avrisp2 -P /dev/ttyS4 -b 19200 -U hfuse:w:0xD9:m -U lfuse:w:0x5E:m -U efuse:w:0xFF:m
+	avrdude -p $(MCU2) -c avrisp2 -P /dev/ttyS5 -b 19200 -U hfuse:w:0xD9:m -U lfuse:w:0x5E:m -U efuse:w:0xFF:m
 
 flash:
-	avrdude -p $(MCU2) -c avrisp2 -P /dev/ttyS4 -b 19200 -U flash:w:$(TARGET).hex:i
+	avrdude -p $(MCU2) -c avrisp2 -P /dev/ttyS5 -b 19200 -U flash:w:$(TARGET).hex:i
 
 clean:
 	rm -f *.o *.bin *.hex
