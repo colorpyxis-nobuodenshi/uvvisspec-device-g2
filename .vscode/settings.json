@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "stdbool.h": "c",
+        "stdint.h": "c",
+        "spi.h": "c",
+        "opt.h": "c"
+    }
+}
